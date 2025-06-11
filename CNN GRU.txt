@@ -1,0 +1,495 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+import os
+from datetime import datetime, timedelta
+
+# Установим для воспроизводимости
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# --- 1. Инициализация TPU (или MirroredStrategy для CPU/GPU) ---
+print("\nИнициализация TPU и стратегии...")
+strategy = None
+try:
+    # Попытка инициализации TPU. Если вы не на Kaggle/Colab с TPU, этот блок вызовет ошибку.
+    resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu='local') # Для Kaggle/Colab TPU
+    print(f"Подключение к TPU: {resolver.master()}")
+    tf.config.experimental_connect_to_cluster(resolver)
+    tf.tpu.experimental.initialize_tpu_system(resolver)
+    strategy = tf.distribute.TPUStrategy(resolver)
+    print("TPU инициализирована успешно.")
+    print('Количество реплик (TPU ядер): {}'.format(strategy.num_replicas_in_sync))
+
+except ValueError as e:
+    print(f"Ошибка инициализации TPU: {e}. TPU недоступна или не настроена.")
+    print("Продолжение без TPU (будет использовать CPU/GPU если доступно).")
+    # Fallback на MirroredStrategy для использования CPU/GPU
+    try:
+        strategy = tf.distribute.MirroredStrategy()
+        print(f"Используемая стратегия: {strategy.__class__.__name__}")
+        print(f"Количество реплик в синхронизации: {strategy.num_replicas_in_sync}")
+        if strategy.num_replicas_in_sync == 0: # Дополнительная проверка
+             print("Внимание: MirroredStrategy не нашла доступных GPU. Будет использован CPU.")
+    except Exception as mir_e:
+        print(f"Ошибка инициализации MirroredStrategy: {mir_e}. Используется стратегия по умолчанию (CPU).")
+        strategy = tf.distribute.get_strategy() # Стратегия по умолчанию (обычно CPU)
+
+
+if strategy is None: # Если и TPU, и MirroredStrategy не сработали
+     print("Не удалось определить стратегию распределения. Используется стратегия по умолчанию (CPU).")
+     strategy = tf.distribute.get_strategy()
+
+# --- 2. Загрузка и предобработка данных ---
+# *** ПУТЬ К ДАТАСЕТУ ***
+# ИЗМЕНИТЕ ЭТО, ЕСЛИ ВЫ ХОТИТЕ SOLANA, А НЕ TON. Убедитесь, что файл содержит нужные данные.
+DATASET_PATH = '/kaggle/input/ethhhh/ton.csv' # Пример пути для Kaggle
+# DATASET_PATH = 'ton.csv' # Если файл в той же директории
+print(f"\nЗагрузка данных из: {DATASET_PATH}")
+
+try:
+    df = pd.read_csv(DATASET_PATH)
+except FileNotFoundError:
+    print(f"ОШИБКА: Файл не найден по пути {DATASET_PATH}. Проверьте путь и имя файла.")
+    exit()
+
+# Убедитесь, что колонка 'date' и 'price' существуют
+if 'date' not in df.columns or 'price' not in df.columns:
+    print(f"ОШИБКА: В файле {DATASET_PATH} отсутствуют необходимые колонки 'date' или 'price'.")
+    print(f"Найденные колонки: {df.columns.tolist()}")
+    exit()
+
+df['date'] = pd.to_datetime(df['date'], format="%y-%m-%d %H:%M:%S") # Убедитесь, что формат 'yy-mm-dd HH:MM:SS' соответствует вашим данным
+
+df.sort_values(by='date', inplace=True)
+df.reset_index(drop=True, inplace=True)
+
+print("Первые 5 строк данных:")
+print(df.head())
+print(f"Размер данных: {df.shape}")
+
+# Определяем частоту данных
+time_diffs = df['date'].diff().dropna()
+steps_per_day = 1 # Значение по умолчанию
+step_timedelta_unit = timedelta(days=1) # Значение по умолчанию
+LOOK_BACK_DESCRIPTION = ""
+
+if not time_diffs.empty:
+    if len(time_diffs.value_counts()) == 1: # Если все интервалы одинаковы
+        freq = time_diffs.value_counts().index[0]
+        if freq == timedelta(days=1):
+            steps_per_day = 1
+            step_timedelta_unit = timedelta(days=1)
+            LOOK_BACK_DESCRIPTION = "(что эквивалентно LOOK_BACK дням ежедневных данных)"
+            print("Данные, вероятно, ежедневные.")
+        elif freq == timedelta(hours=1):
+            steps_per_day = 24
+            step_timedelta_unit = timedelta(hours=1)
+            LOOK_BACK_DESCRIPTION = "(что эквивалентно LOOK_BACK/24 дням почасовых данных)"
+            print("Данные, вероятно, почасовые.")
+        elif freq == timedelta(minutes=1):
+            steps_per_day = 24 * 60
+            step_timedelta_unit = timedelta(minutes=1)
+            LOOK_BACK_DESCRIPTION = "(что эквивалентно LOOK_BACK/1440 дням поминутных данных)"
+            print("Данные, вероятно, поминутные.")
+        else:
+            print(f"Обнаружена однородная частота, но она не стандартная (день/час/минута): {freq}.")
+            step_timedelta_unit = freq
+            try: # Обработка деления на ноль, если freq = 0 (маловероятно для diff)
+                steps_per_day = timedelta(days=1).total_seconds() / freq.total_seconds() if freq.total_seconds() != 0 else 1
+            except AttributeError: # Если freq не timedelta (очень маловероятно)
+                steps_per_day = 1
+            LOOK_BACK_DESCRIPTION = f"(что эквивалентно LOOK_BACK * {freq} времени)"
+    else:
+        print("Частота данных неоднородна. Используется timedelta(days=1) по умолчанию для шага прогноза.")
+        # steps_per_day и step_timedelta_unit остаются по умолчанию
+        LOOK_BACK_DESCRIPTION = "(используется LOOK_BACK дней, т.к. частота неоднородна или не определена)"
+else:
+    print("Недостаточно данных для определения частоты (менее 2 точек). Используется timedelta(days=1) по умолчанию.")
+    # steps_per_day и step_timedelta_unit остаются по умолчанию
+    LOOK_BACK_DESCRIPTION = "(используется LOOK_BACK дней, т.к. частота неоднородна или не определена)"
+
+
+prices_raw = df['price'].values.reshape(-1, 1)
+scaler = MinMaxScaler(feature_range=(0, 1))
+prices_scaled = scaler.fit_transform(prices_raw)
+print("Цены успешно нормализованы.")
+
+# **********************************************************************
+# *** ИЗМЕНЕНИЕ ЗДЕСЬ: Размер 'look_back' окна. ***
+LOOK_BACK = 60 # Используем 120 последних временных шагов для предсказания следующего.
+# **********************************************************************
+print(f"Размер 'look_back' окна: {LOOK_BACK} временных шагов {LOOK_BACK_DESCRIPTION}.")
+
+
+def create_sequences(data, look_back):
+    X, y = [], []
+    if len(data) <= look_back: # Проверка, достаточно ли данных
+        return np.array(X), np.array(y)
+    for i in range(len(data) - look_back):
+        X.append(data[i:(i + look_back), 0])
+        y.append(data[i + look_back, 0])
+    return np.array(X), np.array(y)
+
+X, y = create_sequences(prices_scaled, LOOK_BACK)
+if X.shape[0] == 0:
+    raise ValueError(f"После создания последовательностей с LOOK_BACK={LOOK_BACK} не осталось данных для обучения/тестирования. "
+                     f"Общее количество точек данных: {len(prices_scaled)}. "
+                     f"Уменьшите LOOK_BACK или увеличьте объем данных.")
+
+X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+
+print(f"Форма X (входы для GRU): {X.shape}")
+print(f"Форма y (выходы): {y.shape}")
+
+train_size = int(len(X) * 0.8)
+X_train, X_test = X[:train_size], X[train_size:]
+y_train, y_test = y[:train_size], y[train_size:]
+
+if X_train.shape[0] == 0 or X_test.shape[0] == 0:
+    raise ValueError(f"Тренировочная ({X_train.shape[0]}) или тестовая ({X_test.shape[0]}) выборка пусты. "
+                     f"Проверьте train_size ({train_size}) и объем данных после create_sequences ({len(X)}).")
+
+print(f"Форма X_train: {X_train.shape}")
+print(f"Форма X_test: {X_test.shape}")
+
+# --- 3. Построение и компиляция модели GRU ---
+GRU_UNITS = 192 # Вы можете поэкспериментировать с этим значением
+def build_gru_model(look_back, num_features):
+    model = tf.keras.Sequential([
+        tf.keras.layers.GRU(units=GRU_UNITS, return_sequences=True, input_shape=(look_back, num_features),
+                            kernel_regularizer=tf.keras.regularizers.l2(0.001)),
+        tf.keras.layers.Dropout(0.3),
+        tf.keras.layers.GRU(units=GRU_UNITS, return_sequences=False,
+                            kernel_regularizer=tf.keras.regularizers.l2(0.001)),
+        tf.keras.layers.Dropout(0.3),
+        tf.keras.layers.Dense(units=1)
+    ])
+    model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+    return model
+
+with strategy.scope():
+    num_features = X_train.shape[2]
+    model = build_gru_model(LOOK_BACK, num_features)
+
+print("\nАрхитектура модели GRU:")
+model.summary()
+print(f"Общее количество параметров модели: {model.count_params()}")
+
+
+# --- 4. Обучение модели ---
+BATCH_SIZE = 256 * strategy.num_replicas_in_sync if strategy.num_replicas_in_sync > 0 else 256
+EPOCHS = 250 # Количество эпох обучения.
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=25, restore_best_weights=True)
+model_checkpoint = tf.keras.callbacks.ModelCheckpoint('best_ton_price_gru_model.keras', monitor='val_loss', save_best_only=True, mode='min', verbose=1)
+reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=15, min_lr=0.00001, verbose=1)
+
+print(f"\nНачинаем обучение модели GRU с {EPOCHS} эпохами и batch_size={BATCH_SIZE}...")
+history = model.fit(X_train, y_train,
+                    epochs=EPOCHS,
+                    batch_size=BATCH_SIZE,
+                    validation_data=(X_test, y_test),
+                    callbacks=[early_stopping, model_checkpoint, reduce_lr],
+                    verbose=1)
+
+print("\nОбучение завершено.")
+print("Модель сохранена как 'best_ton_price_gru_model.keras'")
+
+with strategy.scope():
+    model = tf.keras.models.load_model('best_ton_price_gru_model.keras')
+    # Перекомпиляция не всегда обязательна после загрузки, если вы не меняете оптимизатор/лосс,
+    # но для использования с TPU/MirroredStrategy может быть полезна.
+    model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+print("Лучшая модель загружена и перекомпилирована.")
+
+
+# --- 5. Оценка модели ---
+print("\nОценка модели на тестовых данных...")
+test_loss, test_mae = model.evaluate(X_test, y_test, batch_size=BATCH_SIZE, verbose=0)
+print(f"Тестовая MSE: {test_loss:.6f}")
+print(f"Тестовая MAE: {test_mae:.6f}")
+
+predictions_scaled = model.predict(X_test, batch_size=BATCH_SIZE)
+predictions = scaler.inverse_transform(predictions_scaled.reshape(-1, 1))
+actual_prices = scaler.inverse_transform(y_test.reshape(-1, 1))
+rmse = np.sqrt(mean_squared_error(actual_prices, predictions))
+print(f"RMSE на тестовых данных: {rmse:.2f}")
+
+# Даты для тестовой выборки
+# Индекс конца обучающей выборки в исходном df (до масштабирования и создания последовательностей)
+# train_size - это размер X_train. Каждая запись в X_train/X_test сдвинута на LOOK_BACK от y_train/y_test
+# Первая дата для y_test соответствует df.iloc[train_size + LOOK_BACK]
+test_dates_start_index = train_size + LOOK_BACK
+test_dates = df['date'][test_dates_start_index : test_dates_start_index + len(y_test)]
+
+
+plt.figure(figsize=(16, 8))
+plt.plot(test_dates, actual_prices, label='Фактическая цена')
+plt.plot(test_dates, predictions, label='Предсказанная цена (one-step-ahead на тесте)')
+plt.title('Предсказание цены на тестовой выборке (GRU)')
+plt.xlabel('Дата и время')
+plt.ylabel('Цена (USD)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(12, 6))
+plt.plot(history.history['loss'], label='Потери на обучении')
+plt.plot(history.history['val_loss'], label='Потери на валидации')
+plt.title('График потерь во время обучения')
+plt.xlabel('Эпоха')
+plt.ylabel('Потери (MSE)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+# --- 6. Функция для непрерывного предсказания будущих цен ---
+def generate_continuous_forecast(model, scaler, historical_prices_scaled, look_back,
+                                 forecast_start_datetime, forecast_end_datetime,
+                                 step_timedelta_unit, last_known_date_in_df):
+    
+    current_price_buffer_scaled = []
+    if len(historical_prices_scaled) < look_back:
+        temp_buffer = list(historical_prices_scaled.flatten())
+        print(f"Предупреждение: исторических данных ({len(temp_buffer)}) меньше, чем LOOK_BACK ({look_back}). Буфер будет дополнен.")
+        if not temp_buffer:
+             current_price_buffer_scaled = [0.0] * look_back
+        else:
+             current_price_buffer_scaled = [temp_buffer[0]] * (look_back - len(temp_buffer)) + temp_buffer
+    else:
+        current_price_buffer_scaled = list(historical_prices_scaled[-look_back:].flatten())
+    
+    predicted_dates_list = []
+    predicted_prices_scaled_list = []
+    current_forecast_dt = forecast_start_datetime
+
+    if current_forecast_dt <= last_known_date_in_df:
+        print(f"Коррекция даты начала прогноза: {current_forecast_dt.strftime('%Y-%m-%d %H:%M:%S')} <= {last_known_date_in_df.strftime('%Y-%m-%d %H:%M:%S')}")
+        current_forecast_dt = last_known_date_in_df + step_timedelta_unit
+        print(f"Новая дата начала прогноза: {current_forecast_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+    print(f"Начало непрерывного прогноза с {current_forecast_dt.strftime('%Y-%m-%d %H:%M:%S')} до {forecast_end_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    while current_forecast_dt <= forecast_end_datetime:
+        sequence_for_prediction = np.array(current_price_buffer_scaled).reshape(1, look_back, 1)
+        next_prediction_scaled = model.predict(sequence_for_prediction, verbose=0)[0, 0]
+        
+        current_price_buffer_scaled.append(next_prediction_scaled)
+        current_price_buffer_scaled = current_price_buffer_scaled[-look_back:]
+
+        predicted_dates_list.append(current_forecast_dt)
+        predicted_prices_scaled_list.append(next_prediction_scaled)
+        current_forecast_dt += step_timedelta_unit
+        
+    predicted_prices_usd_array = scaler.inverse_transform(np.array(predicted_prices_scaled_list).reshape(-1, 1)).flatten()
+    return predicted_dates_list, predicted_prices_usd_array
+
+# --- 7. Логика торговых сигналов и визуализация ---
+TRADE_AMOUNT = 100
+HOLDING_PERIODS_DAYS = [1, 2, 3, 4 ,5, 6, 7, 14, 21, 30, 60]
+MIN_PROFIT_PERCENT = 0.02
+ENTRY_CANDIDATE_WINDOW = 5 # дней
+DAYS_COOLDOWN_AFTER_TRADE = 5 # дней
+
+def analyze_and_plot_trades(predicted_dates, predicted_prices, actual_prices_df,
+                            plot_overall_start_date, plot_overall_end_date, 
+                            look_back_param, steps_per_day_local): # Renamed look_back to avoid conflict, steps_per_day_in_data to steps_per_day_local
+    
+    plt.figure(figsize=(20, 10))
+
+    plt.plot(actual_prices_df['date'], actual_prices_df['price'], label='Фактическая цена (история)', color='blue', alpha=0.7)
+
+    plot_predicted_prices_segment = []
+    plot_predicted_dates_segment = []
+
+    if predicted_dates and len(predicted_dates) > 0: # Check if predicted_dates is not None and not empty
+        last_actual_date = actual_prices_df['date'].iloc[-1]
+        start_idx_for_plot = -1
+        for i, d_pred in enumerate(predicted_dates):
+            if d_pred > last_actual_date:
+                start_idx_for_plot = i
+                break
+        
+        if start_idx_for_plot != -1:
+            plot_predicted_dates_segment = predicted_dates[start_idx_for_plot:]
+            plot_predicted_prices_segment = predicted_prices[start_idx_for_plot:]
+
+            if len(plot_predicted_dates_segment) > 0: # Ensure segment is not empty
+                plt.plot(plot_predicted_dates_segment, plot_predicted_prices_segment, label='Предсказанная цена (будущее)', color='red', linestyle='--')
+                last_actual_price = actual_prices_df['price'].iloc[-1]
+                plt.plot([last_actual_date, plot_predicted_dates_segment[0]],
+                         [last_actual_price, plot_predicted_prices_segment[0]],
+                         color='grey', linestyle=':', label='Стык факт/прогноз')
+    else:
+        print("Нет данных для прогноза на графике (predicted_dates пуст или None).")
+
+    trades = []
+    current_trade_exit_idx = -1
+    
+    # Используем глобальную steps_per_day, если steps_per_day_local не передана или неверна
+    # Однако, в вызове мы передаем steps_per_day, так что steps_per_day_local будет им.
+    holding_periods_steps_calc = [h * steps_per_day_local for h in HOLDING_PERIODS_DAYS]
+
+
+    if len(plot_predicted_prices_segment) > 0: # ИСПРАВЛЕННАЯ ПРОВЕРКА
+        print("\nАнализ торговых сигналов на предсказанном графике:")
+        for i in range(len(plot_predicted_prices_segment)):
+            current_date_trade = plot_predicted_dates_segment[i]
+            current_price_trade = plot_predicted_prices_segment[i]
+
+            if i < current_trade_exit_idx:
+                continue
+            
+            if i > ENTRY_CANDIDATE_WINDOW and i < len(plot_predicted_prices_segment) - 1:
+                window_for_min = plot_predicted_prices_segment[i-ENTRY_CANDIDATE_WINDOW : i+1]
+                if current_price_trade == min(window_for_min) and \
+                   plot_predicted_prices_segment[i+1] > current_price_trade:
+                    
+                    best_profit_percent_trade = -1.0
+                    best_holding_period_steps_trade = -1
+                    exit_price_trade = 0
+                    exit_date_trade = None
+
+                    for hp_steps in holding_periods_steps_calc:
+                        exit_idx_trade = i + hp_steps
+                        if exit_idx_trade < len(plot_predicted_prices_segment):
+                            potential_exit_price_trade = plot_predicted_prices_segment[exit_idx_trade]
+                            profit_percent_trade = (potential_exit_price_trade - current_price_trade) / current_price_trade
+                            
+                            if profit_percent_trade > best_profit_percent_trade:
+                                best_profit_percent_trade = profit_percent_trade
+                                best_holding_period_steps_trade = hp_steps
+                                exit_price_trade = potential_exit_price_trade
+                                exit_date_trade = plot_predicted_dates_segment[exit_idx_trade]
+                    
+                    if best_profit_percent_trade >= MIN_PROFIT_PERCENT:
+                        profit_usd_trade = TRADE_AMOUNT * best_profit_percent_trade
+                        trades.append({
+                            'entry_date': current_date_trade, 'entry_price': current_price_trade,
+                            'exit_date': exit_date_trade, 'exit_price': exit_price_trade,
+                            'profit_usd': profit_usd_trade, 'profit_percent': best_profit_percent_trade
+                        })
+                        print(f"  Вход: {current_date_trade.strftime('%Y-%m-%d %H:%M:%S')} @ {current_price_trade:.2f}$")
+                        print(f"  Выход: {exit_date_trade.strftime('%Y-%m-%d %H:%M:%S')} @ {exit_price_trade:.2f}$ (через {best_holding_period_steps_trade / steps_per_day_local} дней)")
+                        print(f"  Прибыль: {profit_usd_trade:.2f}$ ({best_profit_percent_trade:.2%})\n")
+                        current_trade_exit_idx = i + best_holding_period_steps_trade + DAYS_COOLDOWN_AFTER_TRADE * steps_per_day_local
+        for trade in trades:
+            plt.plot(trade['entry_date'], trade['entry_price'], 'gs', ms=10, mfc='none', mec='green', mew=2)
+            plt.plot(trade['entry_date'], trade['entry_price'], 'go', ms=4, mfc='green')
+            plt.text(trade['entry_date'], trade['entry_price'] * 1.015, f"{trade['entry_price']:.2f}$", c='green', fs=9, ha='center', va='bottom')
+            plt.text(trade['entry_date'], trade['entry_price'] * 0.985, f"Вход\n({trade['entry_date'].strftime('%m-%d')})", c='blue', fs=8, ha='center', va='top')
+            plt.plot(trade['exit_date'], trade['exit_price'], 'rs', ms=10, mfc='none', mec='red', mew=2)
+            plt.plot(trade['exit_date'], trade['exit_price'], 'ro', ms=4, mfc='red')
+            plt.text(trade['exit_date'], trade['exit_price'] * 1.015, f"{trade['exit_price']:.2f}$", c='green', fs=9, ha='center', va='bottom')
+            plt.text(trade['exit_date'], trade['exit_price'] * 0.985, f"Выход\n({trade['exit_date'].strftime('%m-%d')})\nПрофит: {trade['profit_usd']:.2f}$", c='red', fs=8, ha='center', va='top')
+            plt.plot([trade['entry_date'], trade['exit_date']], [trade['entry_price'], trade['exit_price']], c='gray', ls=':', lw=0.8)
+
+    plt.title(f'Прогноз цены с торговыми сигналами (LONG)') # Можно добавить название монеты, если оно известно
+    plt.xlabel('Дата')
+    plt.ylabel('Цена (USD)')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.xlim(plot_overall_start_date, plot_overall_end_date + timedelta(days=5))
+
+    plt.text(0.98, 0.98, f"Ставки в графике предсказаний - {TRADE_AMOUNT}$.",
+             transform=plt.gca().transAxes, fontsize=12, color='black',
+             verticalalignment='top', horizontalalignment='right',
+             bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.7))
+    plt.tight_layout()
+    plt.show()
+
+# --- 8. Запуск основного сценария ---
+if __name__ == "__main__":
+    print("\n--- Запуск предсказания и анализа торговых сигналов ---")
+
+    forecast_initial_start_datetime = df['date'].iloc[-1] + step_timedelta_unit
+    forecast_days_ahead = 90
+    forecast_final_end_datetime = forecast_initial_start_datetime + timedelta(days=forecast_days_ahead)
+
+    print(f"Генерация непрерывного прогноза с {forecast_initial_start_datetime.strftime('%Y-%m-%d')} до {forecast_final_end_datetime.strftime('%Y-%m-%d')}")
+
+    full_predicted_dates, full_predicted_prices = generate_continuous_forecast(
+        model, scaler, prices_scaled, LOOK_BACK,
+        forecast_initial_start_datetime, forecast_final_end_datetime,
+        step_timedelta_unit, df['date'].iloc[-1]
+    )
+
+    analyze_and_plot_trades(full_predicted_dates, full_predicted_prices, df,
+                            df['date'].iloc[0], 
+                            forecast_final_end_datetime,
+                            LOOK_BACK, steps_per_day) # steps_per_day - это глобальная переменная, определенная ранее
+
+    print("\n--- Интерактивный режим предсказания (без торговых сигналов) ---")
+    print("Для выхода введите 'exit'.")
+    print("Пример ввода: '25-06-03,3.1993$' (что означает 2025 год, 06 месяц, 03 день, цена)")
+
+    while True:
+        try:
+            user_input = input("Введите текущую дату и цену (например, '25-06-03,3.1993$') или 'exit': ").strip()
+            if user_input.lower() == 'exit':
+                print("Выход из программы.")
+                break
+            parts = user_input.split(',')
+            if len(parts) != 2: raise ValueError("Неверный формат ввода. Используйте 'ГГ-ММ-ДД,Цена$'.")
+            
+            input_date_str = parts[0].strip()
+            input_price_str = parts[1].strip()
+
+            if not input_price_str.endswith('$'): raise ValueError("Цена должна заканчиваться символом '$'.")
+            input_price = float(input_price_str[:-1])
+
+            interactive_forecast_horizons_days = [1, 7, 14, 21, 30, 60]
+            
+            # Для интерактивного режима мы создаем временный набор данных, добавляя ввод пользователя
+            # Это не перезаписывает основной df или prices_scaled
+            temp_historical_prices_raw = np.append(prices_raw, [[input_price]], axis=0)
+            temp_historical_prices_scaled = scaler.transform(temp_historical_prices_raw) # Используем уже обученный scaler
+
+            interactive_input_date = datetime.strptime(input_date_str, '%y-%m-%d')
+            # Прогноз начинается со следующего шага после введенной пользователем даты
+            interactive_forecast_start_dt = interactive_input_date + step_timedelta_unit 
+            interactive_forecast_end_dt = interactive_input_date + timedelta(days=max(interactive_forecast_horizons_days))
+            
+            print(f"\nВыполняем интерактивный прогноз из точки: {input_date_str}, {input_price:.2f}$ на {max(interactive_forecast_horizons_days)} дней.")
+
+            interactive_pred_dates, interactive_pred_prices = generate_continuous_forecast(
+                model, scaler, 
+                temp_historical_prices_scaled, # Передаем расширенную историю
+                LOOK_BACK,
+                interactive_forecast_start_dt,
+                interactive_forecast_end_dt,
+                step_timedelta_unit,
+                interactive_input_date # Последняя известная дата - это введенная пользователем
+            )
+
+            print("\nРезультаты интерактивного прогноза:")
+            if not interactive_pred_dates:
+                print("Не удалось сгенерировать интерактивный прогноз.")
+            else:
+                for days_ahead in sorted(interactive_forecast_horizons_days):
+                    target_date_interactive = interactive_input_date + timedelta(days=days_ahead)
+                    closest_idx_interactive = -1
+                    min_diff_seconds = float('inf')
+
+                    for idx, p_date_interactive in enumerate(interactive_pred_dates):
+                        diff_seconds = abs((p_date_interactive - target_date_interactive).total_seconds())
+                        if diff_seconds < min_diff_seconds:
+                            min_diff_seconds = diff_seconds
+                            closest_idx_interactive = idx
+                    
+                    # Проверяем, что найденная дата достаточно близка (в пределах 1.5 шагов)
+                    if closest_idx_interactive != -1 and min_diff_seconds < (step_timedelta_unit.total_seconds() * 1.5):
+                        print(f"Через {days_ahead} дней ({interactive_pred_dates[closest_idx_interactive].strftime('%y-%m-%d')}): {interactive_pred_prices[closest_idx_interactive]:.5f}$")
+                    else:
+                        print(f"Не удалось получить точный прогноз для {days_ahead} дней (целевая дата {target_date_interactive.strftime('%y-%m-%d')}). Ближайший прогноз: {interactive_pred_dates[closest_idx_interactive].strftime('%y-%m-%d') if closest_idx_interactive != -1 else 'нет'}")
+        
+        except ValueError as e:
+            print(f"Ошибка ввода или обработки: {e}. Пожалуйста, попробуйте еще раз.")
+        except Exception as e:
+            print(f"Произошла непредвиденная ошибка: {e}. Пожалуйста, попробуйте еще раз.")
